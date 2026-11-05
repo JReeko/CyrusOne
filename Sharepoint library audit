@@ -1,0 +1,121 @@
+"""
+SharePoint marketing library audit (proof-of-concept)
+
+What it does:
+  1. Walks a SharePoint document library through Microsoft Graph.
+  2. Flags governance issues: stale files, messy "final_v2" names, duplicate names,
+     and files last edited by someone who may have left.
+  3. (Optional) Asks Claude to suggest an asset type + folder for each file, using
+     FILE NAMES ONLY. No file contents are sent. A human reviews every suggestion.
+  4. Writes audit_report.csv for the team to review. Nothing is moved or deleted.
+
+Setup:
+  pip install msal requests anthropic
+  Register an Entra ID app with read-only Graph permission (Sites.Read.All or
+  Files.Read.All, admin-consented) and get IT approval before running on real data.
+
+Environment variables:
+  TENANT_ID, CLIENT_ID, CLIENT_SECRET, DRIVE_ID, ANTHROPIC_API_KEY (optional)
+"""
+import csv
+import json
+import os
+import re
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+
+import msal
+import requests
+
+STALE_AFTER_DAYS = 365
+MESSY_NAME = re.compile(r"(final|copy|v\d+|new|old|draft)\D*$", re.IGNORECASE)
+GRAPH = "https://graph.microsoft.com/v1.0"
+
+
+def get_token():
+    app = msal.ConfidentialClientApplication(
+        os.environ["CLIENT_ID"],
+        authority=f"https://login.microsoftonline.com/{os.environ['TENANT_ID']}",
+        client_credential=os.environ["CLIENT_SECRET"],
+    )
+    result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+    return result["access_token"]
+
+
+def list_children(headers, drive_id, item_id=None):
+    """Yield every file in the library, recursing into folders and following paging."""
+    base = f"{GRAPH}/drives/{drive_id}"
+    url = f"{base}/items/{item_id}/children" if item_id else f"{base}/root/children"
+    while url:
+        data = requests.get(url, headers=headers, timeout=30).json()
+        for item in data.get("value", []):
+            if "folder" in item:
+                yield from list_children(headers, drive_id, item["id"])
+            else:
+                yield item
+        url = data.get("@odata.nextLink")
+
+
+def suggest_tags(files):
+    """Ask Claude for an asset type and folder per file name. Suggestions only."""
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return {}
+    import anthropic
+
+    client = anthropic.Anthropic()
+    suggestions = {}
+    names = [f["name"] for f in files]
+    for i in range(0, len(names), 25):
+        batch = names[i : i + 25]
+        prompt = (
+            "Classify these marketing file names. Return ONLY a JSON object mapping each "
+            'file name to {"asset_type": one of [logo, photo, deck, social, press, '
+            'report, contract, other], "suggested_folder": short string}. '
+            "Use only the name; if unsure, use 'other'.\n" + json.dumps(batch)
+        )
+        reply = client.messages.create(
+            model="claude-sonnet-5-5",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = re.sub(r"```json|```", "", reply.content[0].text).strip()
+        try:
+            suggestions.update(json.loads(text))
+        except json.JSONDecodeError:
+            pass  # skip a bad batch rather than guessing
+    return suggestions
+
+
+def main():
+    headers = {"Authorization": f"Bearer {get_token()}"}
+    files = list(list_children(headers, os.environ["DRIVE_ID"]))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=STALE_AFTER_DAYS)
+    name_counts = Counter(f["name"].lower() for f in files)
+    tags = suggest_tags(files)
+
+    with open("audit_report.csv", "w", newline="", encoding="utf-8") as out:
+        writer = csv.writer(out)
+        writer.writerow(["name", "link", "last_modified", "last_modified_by",
+                         "issues", "suggested_type", "suggested_folder", "human_decision"])
+        for f in files:
+            modified = datetime.fromisoformat(f["lastModifiedDateTime"].replace("Z", "+00:00"))
+            stem = os.path.splitext(f["name"])[0]
+            issues = []
+            if modified < cutoff:
+                issues.append(f"stale (>{STALE_AFTER_DAYS} days)")
+            if MESSY_NAME.search(stem):
+                issues.append("version-style name")
+            if name_counts[f["name"].lower()] > 1:
+                issues.append("duplicate name")
+            tag = tags.get(f["name"], {})
+            writer.writerow([
+                f["name"], f["webUrl"], modified.date(),
+                f.get("lastModifiedBy", {}).get("user", {}).get("displayName", ""),
+                "; ".join(issues), tag.get("asset_type", ""),
+                tag.get("suggested_folder", ""), "",  # reviewer fills this in
+            ])
+    print(f"Scanned {len(files)} files. Report: audit_report.csv")
+
+
+if __name__ == "__main__":
+    main()

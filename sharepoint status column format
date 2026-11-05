@@ -1,0 +1,13 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/sp/v2/column-formatting.schema.json",
+  "elmType": "div",
+  "style": {
+    "display": "inline-block",
+    "padding": "4px 12px",
+    "border-radius": "12px",
+    "font-weight": "600",
+    "color": "#323130",
+    "background-color": "=if(@currentField == 'Approved', '#dff6dd', if(@currentField == 'In Review', '#fff4ce', if(@currentField == 'Blocked', '#fde7e9', '#f3f2f1')))"
+  },
+  "txtContent": "@currentField"
+}
